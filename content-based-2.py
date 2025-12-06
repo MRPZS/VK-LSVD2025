@@ -1,7 +1,6 @@
 import os
 import polars as pl
 import numpy as np
-from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 import faiss
 from collections import defaultdict
@@ -12,7 +11,16 @@ import gc
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-DATA_DIR = 'VK-LSVD'
+CONFIG = {
+    'data_dir': './VK-LSVD',
+    'train_files': [f'subsamples/up0.01_ip0.01/train/week_{i:02}.parquet' for i in range(0, 24)],
+    'val_files': ['subsamples/up0.01_ip0.01/validation/week_25.parquet'],
+    'meta_users': 'metadata/users_metadata.parquet',
+    'meta_items': 'metadata/items_metadata.parquet',
+    'emb_file': 'metadata/item_embeddings.npz',
+    'submission_file': 'metadata/submission.parquet',
+}
+
 EMBEDDING_DIM = 64
 CANDIDATE_POOL_SIZE = 500  # Number of candidates from FAISS for re-ranking
 FINAL_TOP_K = 100  # Final number of users per item
@@ -21,70 +29,68 @@ MAX_USER_APPEARANCES = 100  # Anti-spam constraint
 # ==============================================================================
 # SECTION 1: DATA LOADING
 # ==============================================================================
-def download_data():
-    """Download all necessary data from HuggingFace."""
-    print("--- Step 1: Downloading data ---")
+def load_all_data() -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame, Dict[int, np.ndarray], pl.DataFrame, pl.DataFrame, np.ndarray]:
+    """
+    Load all data files and return them.
 
-    # Download training interaction files (weeks 18-24 for training)
-    train_files = [f'train/week_{i:02}.parquet' for i in range(18, 25)]
-    for file in tqdm(train_files, desc="Downloading training files"):
-        hf_hub_download('deepvk/VK-LSVD', file, local_dir=DATA_DIR, repo_type='dataset')
-
-    # Download metadata files
-    metadata_files = [
-        'metadata/item_embeddings.npz',
-        'metadata/users_metadata.parquet',
-        'metadata/items_metadata.parquet',
-        'metadata/submission.parquet'
-    ]
-    for file in tqdm(metadata_files, desc="Downloading metadata"):
-        hf_hub_download('deepvk/VK-LSVD', file, local_dir=DATA_DIR, repo_type='dataset')
-
-    print("Data download complete.")
-
-
-def load_all_data() -> Tuple[pl.DataFrame, pl.DataFrame, Dict[int, np.ndarray], pl.DataFrame, pl.DataFrame, pl.DataFrame]:
-    """Load all data files and return them."""
+    Returns:
+        train_interactions: Training data for building user profiles (weeks 0-23)
+        val_interactions: Validation data for training LightGBM ranker (week 25)
+        users_metadata: User demographic information
+        item_embeddings_map: Dict mapping item_id to embedding vector
+        items_metadata: Item metadata
+        submission_df: Submission template with target item_ids
+        item_embeddings_matrix: Raw embedding matrix
+    """
     print("--- Loading data ---")
 
-    # Check if data exists, download if not
-    if not os.path.exists(os.path.join(DATA_DIR, 'train')):
-        download_data()
+    data_dir = CONFIG['data_dir']
 
-    # Load training interactions (weeks 18-24)
-    train_files = [os.path.join(DATA_DIR, f'train/week_{i:02}.parquet') for i in range(18, 25)]
+    # Load training interactions (weeks 0-23 for user profiles)
+    train_files = [os.path.join(data_dir, f) for f in CONFIG['train_files']]
     existing_train_files = [f for f in train_files if os.path.exists(f)]
 
     if not existing_train_files:
-        download_data()
-        existing_train_files = [f for f in train_files if os.path.exists(f)]
+        raise FileNotFoundError(f"No training files found. Expected files in: {data_dir}/subsamples/up0.01_ip0.01/train/")
 
     print(f"Loading {len(existing_train_files)} training files...")
     train_interactions = pl.concat([pl.read_parquet(f) for f in tqdm(existing_train_files, desc="Loading training data")])
 
+    # Load validation interactions (week 25 for LightGBM training)
+    val_files = [os.path.join(data_dir, f) for f in CONFIG['val_files']]
+    existing_val_files = [f for f in val_files if os.path.exists(f)]
+
+    if existing_val_files:
+        print(f"Loading {len(existing_val_files)} validation files...")
+        val_interactions = pl.concat([pl.read_parquet(f) for f in tqdm(existing_val_files, desc="Loading validation data")])
+    else:
+        print("Warning: No validation files found, using last portion of training data")
+        val_interactions = train_interactions
+
     # Load embeddings
-    embedding_file = os.path.join(DATA_DIR, 'metadata/item_embeddings.npz')
+    embedding_file = os.path.join(data_dir, CONFIG['emb_file'])
     embeddings_data = np.load(embedding_file)
     item_ids = embeddings_data['item_id']
     item_embeddings_matrix = embeddings_data['embedding'].astype(np.float32)
     item_embeddings_map = {int(id_): emb for id_, emb in zip(item_ids, item_embeddings_matrix)}
 
     # Load user metadata
-    users_metadata = pl.read_parquet(os.path.join(DATA_DIR, 'metadata/users_metadata.parquet'))
+    users_metadata = pl.read_parquet(os.path.join(data_dir, CONFIG['meta_users']))
 
     # Load item metadata
-    items_metadata = pl.read_parquet(os.path.join(DATA_DIR, 'metadata/items_metadata.parquet'))
+    items_metadata = pl.read_parquet(os.path.join(data_dir, CONFIG['meta_items']))
 
     # Load submission template
-    submission_df = pl.read_parquet(os.path.join(DATA_DIR, 'metadata/submission.parquet'), columns=['item_id'])
+    submission_df = pl.read_parquet(os.path.join(data_dir, CONFIG['submission_file']), columns=['item_id'])
 
     print(f"Loaded {len(train_interactions)} training interactions")
+    print(f"Loaded {len(val_interactions)} validation interactions")
     print(f"Loaded {len(item_embeddings_map)} item embeddings")
     print(f"Loaded {len(users_metadata)} user profiles")
     print(f"Loaded {len(items_metadata)} item profiles")
     print(f"Target items for submission: {len(submission_df)}")
 
-    return train_interactions, users_metadata, item_embeddings_map, items_metadata, submission_df, item_embeddings_matrix
+    return train_interactions, val_interactions, users_metadata, item_embeddings_map, items_metadata, submission_df, item_embeddings_matrix
 
 
 # ==============================================================================
@@ -588,19 +594,20 @@ def main():
     print("=" * 70)
 
     # Step 1: Load all data
-    train_interactions, users_metadata, item_embeddings_map, items_metadata, submission_df, item_embeddings_matrix = load_all_data()
+    train_interactions, val_interactions, users_metadata, item_embeddings_map, items_metadata, submission_df, item_embeddings_matrix = load_all_data()
 
-    # Step 2: Build user profiles
+    # Step 2: Build user profiles from training data (weeks 0-23)
     profiled_user_ids, user_profiles_matrix = build_user_profiles(train_interactions, item_embeddings_map)
     user_profiles_map = {int(uid): profile for uid, profile in zip(profiled_user_ids, user_profiles_matrix)}
 
-    # Step 3: Compute statistics
+    # Step 3: Compute statistics from training data
     user_stats = compute_user_statistics(train_interactions)
     item_stats = compute_item_statistics(train_interactions)
 
-    # Step 4: Create training features for LightGBM
+    # Step 4: Create training features for LightGBM using validation data (week 25)
+    # This simulates the "future" data that the model should predict
     X_train, y_train, groups = create_training_features(
-        train_interactions,
+        val_interactions,  # Use validation data for LightGBM training
         user_profiles_map,
         item_embeddings_map,
         users_metadata,
@@ -639,7 +646,9 @@ def main():
     )
 
     # Step 8: Apply anti-spam constraints
-    popular_users = train_interactions.group_by('user_id').count().sort('count', descending=True).get_column('user_id').to_numpy()
+    # Use all interactions for popularity fallback
+    all_interactions = pl.concat([train_interactions, val_interactions])
+    popular_users = all_interactions.group_by('user_id').count().sort('count', descending=True).get_column('user_id').to_numpy()
     final_predictions = apply_antispam_constraints(
         reranked_candidates,
         target_item_ids,
