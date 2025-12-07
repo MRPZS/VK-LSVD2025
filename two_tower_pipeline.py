@@ -29,13 +29,13 @@ CONFIG = {
 # Model hyperparameters - OPTIMIZED for speed
 MODEL_CONFIG = {
     'embedding_dim': 64,
-    'hidden_dim': 128,
+    'hidden_dim': 256,
     'dropout': 0.1,
-    'learning_rate': 1e-3,
-    'batch_size': 4096,
-    'num_epochs': 5,
-    'max_train_samples': 200000,  # Limit training samples
-    'temperature': 0.05,
+    'learning_rate': 3e-4,
+    'batch_size': 1024,            # Smaller batch = easier learning
+    'num_epochs': 10,
+    'max_train_samples': 300000,
+    'temperature': 0.1,            # Higher = more stable gradients
     'item_emb_dim': 64,
 }
 
@@ -372,7 +372,7 @@ def train_model(model: TwoTowerModel, dataset: TwoTowerDataset,
     feature_store.item_pretrained = feature_store.item_pretrained.to(DEVICE)
 
     model = model.to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=MODEL_CONFIG['learning_rate'])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=MODEL_CONFIG['learning_rate'], weight_decay=0.01)
 
     dataloader = DataLoader(
         dataset,
@@ -383,7 +383,19 @@ def train_model(model: TwoTowerModel, dataset: TwoTowerDataset,
         pin_memory=False
     )
 
+    # Learning rate scheduler with warmup
+    total_steps = len(dataloader) * num_epochs
+    warmup_steps = len(dataloader)  # 1 epoch warmup
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        return max(0.1, 1.0 - (step - warmup_steps) / (total_steps - warmup_steps))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     temperature = MODEL_CONFIG['temperature']
+    best_loss = float('inf')
 
     for epoch in range(num_epochs):
         model.train()
@@ -411,14 +423,17 @@ def train_model(model: TwoTowerModel, dataset: TwoTowerDataset,
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
 
             total_loss += loss.item()
             num_batches += 1
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.6f}'})
 
         avg_loss = total_loss / num_batches
-        print(f"Epoch {epoch+1}: Loss = {avg_loss:.4f}")
+        best_loss = min(best_loss, avg_loss)
+        print(f"Epoch {epoch+1}: Loss = {avg_loss:.4f} (best: {best_loss:.4f})")
 
     return model
 
