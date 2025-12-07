@@ -220,9 +220,10 @@ class FeatureStore:
 
 
 # ==============================================================================
-# SECTION 3: SIMPLIFIED TWO-TOWER MODEL
+# SECTION 3: TWO-TOWER MODEL (Cold-Start Friendly)
 # ==============================================================================
 class UserTower(nn.Module):
+    """User tower: uses user_id + demographics + behavioral features."""
     def __init__(self, num_users, num_genders, num_geos, embedding_dim, hidden_dim):
         super().__init__()
         self.user_emb = nn.Embedding(num_users + 1, 32, padding_idx=0)
@@ -232,9 +233,12 @@ class UserTower(nn.Module):
         # Input: user(32) + gender(8) + geo(16) + age(1) + features(5) = 62
         self.mlp = nn.Sequential(
             nn.Linear(62, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(MODEL_CONFIG['dropout']),
-            nn.Linear(hidden_dim, embedding_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, embedding_dim),
         )
 
     def forward(self, user_idx, gender, geo, age, features):
@@ -249,28 +253,27 @@ class UserTower(nn.Module):
 
 
 class ItemTower(nn.Module):
-    def __init__(self, num_items, num_authors, pretrained_dim, embedding_dim, hidden_dim):
+    """
+    Item tower for COLD-START items.
+    Does NOT use item_id or author_id embeddings (they're 0 for new items).
+    Relies ONLY on pretrained content embeddings + duration.
+    """
+    def __init__(self, pretrained_dim, embedding_dim, hidden_dim):
         super().__init__()
-        self.item_emb = nn.Embedding(num_items + 1, 32, padding_idx=0)
-        self.author_emb = nn.Embedding(num_authors + 1, 16, padding_idx=0)
-        self.pretrained_proj = nn.Linear(pretrained_dim, 32)
-
-        # Input: item(32) + author(16) + pretrained(32) + duration(1) + features(3) = 84
+        # Project pretrained embeddings - this is the KEY for cold-start
+        # Input: pretrained(64) + duration(1) = 65
         self.mlp = nn.Sequential(
-            nn.Linear(84, hidden_dim),
+            nn.Linear(pretrained_dim + 1, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(MODEL_CONFIG['dropout']),
-            nn.Linear(hidden_dim, embedding_dim),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, embedding_dim),
         )
 
-    def forward(self, item_idx, author, duration, pretrained, features):
-        x = torch.cat([
-            self.item_emb(item_idx),
-            self.author_emb(author),
-            self.pretrained_proj(pretrained),
-            duration.unsqueeze(1),
-            features
-        ], dim=1)
+    def forward(self, pretrained, duration):
+        x = torch.cat([pretrained, duration.unsqueeze(1)], dim=1)
         return F.normalize(self.mlp(x), p=2, dim=1)
 
 
@@ -284,8 +287,8 @@ class TwoTowerModel(nn.Module):
             feature_store.num_users, feature_store.num_genders,
             feature_store.num_geos, emb_dim, hidden_dim
         )
+        # Item tower only uses pretrained embeddings + duration (cold-start friendly)
         self.item_tower = ItemTower(
-            feature_store.num_items, feature_store.num_authors,
             MODEL_CONFIG['item_emb_dim'], emb_dim, hidden_dim
         )
 
@@ -299,12 +302,10 @@ class TwoTowerModel(nn.Module):
         )
 
     def get_item_emb(self, item_idx, feature_store):
+        # Only use pretrained embeddings and duration - works for new items!
         return self.item_tower(
-            item_idx,
-            feature_store.item_author[item_idx],
-            feature_store.item_duration[item_idx],
             feature_store.item_pretrained[item_idx],
-            feature_store.item_features[item_idx]
+            feature_store.item_duration[item_idx]
         )
 
 
@@ -442,8 +443,13 @@ def train_model(model: TwoTowerModel, dataset: TwoTowerDataset,
 # SECTION 6: INFERENCE
 # ==============================================================================
 def compute_all_embeddings(model: TwoTowerModel, feature_store: FeatureStore,
-                           target_item_ids: List[int]):
-    """Compute all user and target item embeddings."""
+                           target_item_ids: List[int],
+                           item_embeddings_map: Dict[int, np.ndarray],
+                           items_metadata: pl.DataFrame):
+    """
+    Compute all user and target item embeddings.
+    For items: use pretrained embeddings directly (works for cold-start items).
+    """
     print("\n--- Computing embeddings ---")
     model.eval()
 
@@ -461,16 +467,39 @@ def compute_all_embeddings(model: TwoTowerModel, feature_store: FeatureStore,
     user_embeddings = np.vstack(user_embeddings).astype(np.float32)
     user_ids = np.array([feature_store.idx_to_user_id[idx] for idx in user_indices], dtype=np.uint32)
 
-    # Item embeddings for submission targets
+    # Item embeddings for submission targets - use pretrained embeddings directly!
+    print("Preparing item features for cold-start items...")
+
+    # Get duration for all items from metadata
+    item_duration_map = {}
+    for row in items_metadata.iter_rows(named=True):
+        item_duration_map[row['item_id']] = (row.get('duration', 0) or 0) / 255.0
+
+    # Prepare pretrained embeddings and durations for target items
+    emb_dim = MODEL_CONFIG['item_emb_dim']
+    target_pretrained = []
+    target_durations = []
+
+    for item_id in target_item_ids:
+        if item_id in item_embeddings_map:
+            target_pretrained.append(item_embeddings_map[item_id])
+        else:
+            target_pretrained.append(np.zeros(emb_dim, dtype=np.float32))
+        target_durations.append(item_duration_map.get(item_id, 0.0))
+
+    target_pretrained = np.array(target_pretrained, dtype=np.float32)
+    target_durations = np.array(target_durations, dtype=np.float32)
+
+    # Compute item embeddings through the model
     item_embeddings = []
     with torch.no_grad():
         batch_size = 4096
         for i in tqdm(range(0, len(target_item_ids), batch_size), desc="Item embeddings"):
-            batch_item_ids = target_item_ids[i:i+batch_size]
-            batch_idx = torch.LongTensor([
-                feature_store.item_id_to_idx.get(iid, 0) for iid in batch_item_ids
-            ]).to(DEVICE)
-            emb = model.get_item_emb(batch_idx, feature_store)
+            batch_pretrained = torch.FloatTensor(target_pretrained[i:i+batch_size]).to(DEVICE)
+            batch_duration = torch.FloatTensor(target_durations[i:i+batch_size]).to(DEVICE)
+
+            # Item tower only needs pretrained embeddings and duration
+            emb = model.item_tower(batch_pretrained, batch_duration)
             item_embeddings.append(emb.cpu().numpy())
 
     item_embeddings = np.vstack(item_embeddings).astype(np.float32)
@@ -578,9 +607,11 @@ def main():
     model = TwoTowerModel(feature_store)
     model = train_model(model, dataset, feature_store, MODEL_CONFIG['num_epochs'])
 
-    # Compute embeddings
+    # Compute embeddings (pass item_emb_map and items_meta for cold-start items)
     target_item_ids = submission_df['item_id'].to_list()
-    user_ids, user_embs, item_embs = compute_all_embeddings(model, feature_store, target_item_ids)
+    user_ids, user_embs, item_embs = compute_all_embeddings(
+        model, feature_store, target_item_ids, item_emb_map, items_meta
+    )
 
     # FAISS search
     candidate_indices = faiss_search(user_embs, item_embs, CANDIDATE_POOL_SIZE)
