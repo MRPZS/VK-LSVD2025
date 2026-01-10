@@ -571,9 +571,12 @@ def create_submission(
     """Create and save the final submission file."""
     print("\n--- Creating submission file ---")
 
+    # Convert to numpy array with correct dtype (uint32) and shape (n_items, 100)
     final_predictions_np = np.array(final_predictions, dtype=np.uint32)
+
+    # Create submission with Array type (fixed-size array of 100 uint32 values)
     submission_result = submission_df.with_columns(
-        pl.Series(name='user_id', values=final_predictions_np.tolist())
+        pl.Series(name='user_id', values=final_predictions_np).cast(pl.Array(pl.UInt32, 100))
     )
 
     submission_result.write_parquet(output_filename)
